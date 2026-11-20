@@ -1,0 +1,8 @@
+{
+  "quadlet_glob": "nc-*.container",
+  "backup_source": "/home/me/nextcloud-production",
+  "backup_dir": "/srv/nextcloud-data/backups/storage-guard",
+  "backup_check": ["sh", "/home/me/nextcloud-production/check-hdd.sh"],
+  "keep_backups": 2,
+  "keep_broken": 2
+}

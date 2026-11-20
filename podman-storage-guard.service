@@ -1,0 +1,18 @@
+[Unit]
+Description=Podman storage guard: check and repair container storage after an abrupt power-off
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -B %h/.local/lib/podman-storage-guard/podman_storage_guard.py start
+# Runs at a clean shutdown, after the guarded containers have stopped (they start after the guard).
+ExecStop=/usr/bin/python3 -B %h/.local/lib/podman-storage-guard/podman_storage_guard.py stop
+# Exit 1 means "needs attention" (see last-run.json). The unit must stay active
+# so ExecStop still records the next clean shutdown.
+SuccessExitStatus=1
+# Absorbs the slow first Podman start after boot, a backup and a re-pull.
+TimeoutStartSec=90min
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
