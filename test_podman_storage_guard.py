@@ -3,6 +3,7 @@
 Run: python3 -m unittest test_podman_storage_guard
 """
 
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -36,10 +37,35 @@ class FakeHost:
         self.pull_fails = False
         self.disk_ok = True
         self.kernel = 'EXT4-fs error (device loop0): ext4_mb_generate_buddy: group 1092\nnormal line'
+        self.aof_valid = True           # redis-check-aof result
+        self.aof_fixable = True         # --fix makes the AOF valid
+        self.rdb_valid = True
+        self.command_ok = True          # result of the generic "my-check" command
+        self.unshare_ls_fails = False
+        self.inputs = []                # (command, stdin) for commands that got input
 
-    def __call__(self, command, timeout=600):
+    def __call__(self, command, timeout=600, input_text=None):
         self.calls.append(command)
+        if input_text is not None:
+            self.inputs.append((command, input_text))
         name = command[0]
+        if command[:2] == ['podman', 'run']:
+            tool = command[command.index('--entrypoint') + 1]
+            if tool == 'redis-check-aof':
+                if '--fix' in command:
+                    if input_text != 'y\n':
+                        return 1, 'Continue? [y/N]: Aborted'
+                    self.aof_valid = self.aof_fixable
+                    return 0, 'Successfully truncated AOF'
+                return (0, 'All AOF files and manifest are valid') if self.aof_valid else \
+                    (1, 'AOF appendonly.aof.11.incr.aof is not valid. Use the --fix option to try fixing it.')
+            if tool == 'redis-check-rdb':
+                return (0, 'RDB looks OK!') if self.rdb_valid else (1, '--- RDB ERROR DETECTED ---')
+        if name == 'my-check':
+            return (0, 'ok') if self.command_ok else (2, 'data broken')
+        if name == 'my-repair':
+            self.command_ok = True
+            return 0, 'fixed'
         if name == 'systemctl':
             return (0 if command[-1] in self.running else 3), ''
         if name == 'journalctl':
@@ -57,6 +83,10 @@ class FakeHost:
             if command[2:4] == ['rm', '-rf']:
                 shutil.rmtree(command[4], ignore_errors=True)
                 return 0, ''
+            if command[2:4] == ['ls', '-1']:
+                if self.unshare_ls_fails:
+                    return 2, "ls: cannot open directory '%s': Permission denied" % command[4]
+                return 0, '\n'.join(sorted(p.name for p in Path(command[4]).iterdir()))
         if command[:3] == ['podman', 'system', 'check']:
             if '--repair' in command and self.repair_fixes:
                 self.check_fails = False
@@ -72,7 +102,9 @@ class FakeHost:
         raise AssertionError('unexpected command: %r' % command)
 
 
-class GuardTests(unittest.TestCase):
+class GuardCase(unittest.TestCase):
+    """Temporary home, storage, Quadlets and backup disk, with the fake host patched in."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='storage-guard-')
         self.addCleanup(self.tmp.cleanup)
@@ -84,7 +116,7 @@ class GuardTests(unittest.TestCase):
         (storage / 'overlay-layers/volatile-layers.json').write_text('[]')
         (storage / 'overlay-images/images.json').write_text('[]')
         (storage / 'networks/app-net.json').write_text('{"name": "app-net"}')
-        with sqlite3.connect(storage / 'db.sql') as db:
+        with closing(sqlite3.connect(storage / 'db.sql')) as db:
             db.execute('create table t (x)')
         quadlets = home / '.config/containers/systemd'
         quadlets.mkdir(parents=True)
@@ -131,6 +163,8 @@ class GuardTests(unittest.TestCase):
     def podman_calls(self, *prefix):
         return [c for c in self.host.calls if c[:len(prefix)] == list(prefix)]
 
+
+class GuardTests(GuardCase):
     def test_clean_boot_quick_check_only(self):
         self.clean_shutdown()
         self.assertEqual(self.guard(), 0)
@@ -318,6 +352,158 @@ class RunTests(unittest.TestCase):
                                   'import sys; sys.stderr.buffer.write(b"REDIS0012\\xfa\\tbad"); sys.exit(125)'])
         self.assertEqual(code, 125)
         self.assertIn('REDIS0012', output)
+
+
+class DataCheckTests(GuardCase):
+    """Application data checks; the 20 Nov 2026 case was a Redis AOF with zeros after a clean shutdown."""
+
+    def setUp(self):
+        super().setUp()
+        self.redis = Path(self.settings['backup_source']) / 'redis'
+        (self.redis / 'appendonlydir').mkdir(parents=True)
+        (self.redis / 'appendonlydir/appendonly.aof.manifest').write_text('file appendonly.aof.11.incr.aof seq 11 type i\n')
+        self.settings['data_checks'] = [{'kind': 'redis', 'unit': 'app-redis', 'path': str(self.redis)}]
+
+    def redis_runs(self, flag=None):
+        runs = [c for c in self.host.calls if c[:2] == ['podman', 'run']]
+        return [c for c in runs if flag in c] if flag else runs
+
+    def test_valid_aof_on_a_clean_boot_is_only_checked(self):
+        self.clean_shutdown()
+        self.assertEqual(self.guard(), 0)
+        report = self.report()
+        self.assertEqual(report['state'], 'clean')
+        self.assertEqual(report['data_checks'], [{'name': 'app-redis', 'state': 'ok'}])
+        (check,) = self.redis_runs()
+        self.assertIn(IMAGES[0], check, 'uses the image pinned in the Quadlet')
+        self.assertEqual(check[check.index('--network') + 1], 'none')
+        self.assertIn('%s:/data' % self.redis, check)
+        self.assertEqual(check[-1], '/data/appendonlydir/appendonly.aof.manifest')
+        self.assertEqual(list(self.backups.iterdir()), [], 'no backup when nothing is repaired')
+
+    def test_damaged_aof_after_a_clean_shutdown_is_backed_up_then_fixed(self):
+        self.clean_shutdown()
+        self.host.aof_valid = False
+        self.assertEqual(self.guard(), 0)
+        report = self.report()
+        self.assertEqual(report['state'], 'data_repaired')
+        result = report['data_checks'][0]
+        self.assertEqual(result['state'], 'repaired')
+        self.assertIn('not valid', result['problem'])
+        self.assertIn('backup', report)
+        order = [c[2] if c[1] == 'unshare' else ('fix' if '--fix' in c else 'check')
+                 for c in self.host.calls if c[0] == 'podman' and c[1] in ('unshare', 'run')]
+        self.assertEqual(order, ['ls', 'check', 'tar', 'fix', 'check'], 'backup before the fix, recheck after')
+        (fix,) = self.redis_runs('--fix')
+        self.assertIn(('y\n'), [stdin for cmd, stdin in self.host.inputs if cmd == fix])
+
+    def test_clean_dump_rdb_never_hides_a_damaged_aof(self):
+        # Found on the PS4: appendonlydir is mode 700 for the container user, so a host-side
+        # glob saw nothing and the guard checked the clean dump.rdb instead, reporting "ok".
+        (self.redis / 'dump.rdb').write_bytes(b'REDIS0012')
+        self.clean_shutdown()
+        self.host.aof_valid = False
+        self.assertEqual(self.guard(), 0)
+        self.assertEqual(self.report()['data_checks'][0]['state'], 'repaired')
+        self.assertTrue(all('redis-check-aof' in c for c in self.redis_runs()))
+        self.assertEqual(self.podman_calls('podman', 'unshare', 'ls', '-1'),
+                         [['podman', 'unshare', 'ls', '-1', str(self.redis / 'appendonlydir')]])
+
+    def test_unreadable_aof_folder_is_an_error_not_ok(self):
+        (self.redis / 'dump.rdb').write_bytes(b'REDIS0012')
+        self.clean_shutdown()
+        self.host.unshare_ls_fails = True
+        self.assertEqual(self.guard(), 1)
+        state = self.report()['data_checks'][0]['state']
+        self.assertTrue(state.startswith('error: cannot find the AOF manifest'), state)
+        self.assertEqual(self.redis_runs(), [])
+
+    def test_unfixable_aof_needs_attention_but_does_not_block(self):
+        self.clean_shutdown()
+        self.host.aof_valid = self.host.aof_fixable = False
+        self.assertEqual(self.guard(), 1)
+        report = self.report()
+        self.assertEqual(report['state'], 'needs_attention')
+        self.assertEqual(report['message'], 'Data check failed: app-redis')
+        self.assertEqual(report['data_checks'][0]['state'], 'failed after repair')
+
+    def test_no_data_repair_without_a_verified_backup(self):
+        self.clean_shutdown()
+        self.host.aof_valid = False
+        self.host.disk_ok = False
+        self.assertEqual(self.guard(), 1)
+        report = self.report()
+        self.assertIn('refusing to repair without a backup', report['data_checks'][0]['state'])
+        self.assertEqual(self.redis_runs('--fix'), [])
+
+    def test_abrupt_reset_takes_one_backup_for_storage_and_data(self):
+        self.host.aof_valid = False
+        self.assertEqual(self.guard(), 0)
+        self.assertEqual(self.report()['state'], 'data_repaired')
+        tars = [c for c in self.host.calls if c[:3] == ['podman', 'unshare', 'tar']]
+        self.assertEqual(len(tars), 1)
+
+    def test_running_redis_is_not_checked(self):
+        self.clean_shutdown()
+        self.host.aof_valid = False
+        self.host.running = {'app-redis.service'}
+        self.assertEqual(self.guard(), 0)
+        report = self.report()
+        self.assertEqual(report['state'], 'clean')
+        self.assertEqual(report['data_checks'][0]['state'], 'skipped: app-redis is running')
+        self.assertEqual(self.redis_runs(), [])
+
+    def test_rdb_only_folder_is_checked_and_reported(self):
+        shutil.rmtree(self.redis / 'appendonlydir')
+        (self.redis / 'dump.rdb').write_bytes(b'REDIS0012')
+        self.clean_shutdown()
+        self.host.rdb_valid = False
+        self.assertEqual(self.guard(), 1)
+        result = self.report()['data_checks'][0]
+        self.assertEqual(result['state'], 'failed (no repair configured)')
+        self.assertEqual(self.redis_runs()[0][-1], '/data/dump.rdb')
+        self.assertEqual(list(self.backups.iterdir()), [])
+
+    def test_empty_redis_folder_is_fine(self):
+        shutil.rmtree(self.redis / 'appendonlydir')
+        self.clean_shutdown()
+        self.assertEqual(self.guard(), 0)
+        self.assertEqual(self.report()['data_checks'][0]['state'], 'no data')
+
+    def test_generic_command_check_and_repair(self):
+        self.settings['data_checks'] = [{'kind': 'command', 'name': 'app-check',
+                                         'check': ['my-check'], 'repair': ['my-repair']}]
+        self.clean_shutdown()
+        self.host.command_ok = False
+        self.assertEqual(self.guard(), 0)
+        self.assertEqual(self.report()['data_checks'][0]['state'], 'repaired')
+
+    def test_misconfigured_check_is_reported_not_fatal(self):
+        self.settings['data_checks'] = [{'kind': 'redis', 'unit': 'app-missing', 'path': str(self.redis)},
+                                        {'kind': 'nonsense'}]
+        self.clean_shutdown()
+        self.assertEqual(self.guard(), 1)
+        states = [r['state'] for r in self.report()['data_checks']]
+        self.assertTrue(states[0].startswith('error: app-missing: no image pinned'), states)
+        self.assertTrue(states[1].startswith('error: unknown data check kind'), states)
+
+    def test_data_checks_wait_for_usable_storage(self):
+        self.clean_shutdown()
+        self.host.check_fails = True
+        self.host.disk_ok = False
+        self.assertEqual(self.guard(), 1)
+        self.assertNotIn('data_checks', self.report())
+        self.assertEqual(self.redis_runs(), [])
+
+    def test_check_action_never_repairs(self):
+        self.host.aof_valid = False
+        with patch.object(guard, 'load_settings', return_value=self.settings), \
+             patch('builtins.print') as printed:
+            self.assertEqual(guard.main(['check']), 1)
+        output = json.loads(printed.call_args.args[0])
+        self.assertEqual(output['data_checks'][0]['state'], 'failed (check only)')
+        self.assertEqual(self.redis_runs('--fix'), [])
+        self.assertEqual(list(self.backups.iterdir()), [])
 
 
 if __name__ == '__main__':

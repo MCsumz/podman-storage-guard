@@ -11,15 +11,19 @@ rebuilt by hand. This systemd user unit runs before the Quadlet containers:
          ``podman system check --repair --force``; re-pull missing pinned images; and if that
          is not enough, rebuild the storage (move it aside, keep the network definitions, pull
          every image pinned by digest in the Quadlet files).
+         Then, at every boot, run the configured data checks (for example a Redis AOF check
+         in a throwaway container from the pinned image) and repair what fails, after a backup.
   stop   Write the clean-shutdown marker (runs after the containers have stopped).
-  check  Run the full check only and print the problems.
+  check  Run the full storage check and the data checks only, and print the problems.
 
 Nothing destructive happens while a guarded container is running, and nothing is repaired
-without a finished, verified backup. Application data in bind mounts is never touched.
+without a finished, verified backup. Application data in bind mounts is changed only by a
+configured data repair (such as ``redis-check-aof --fix``), and only after that backup.
 Settings: ~/.config/podman-storage-guard/config.json (see config.example.json).
 """
 
 import argparse
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -50,6 +54,11 @@ DEFAULTS = {
     'backup_check': None,
     'keep_backups': 2,
     'keep_broken': 2,
+    # Application data checked at every boot, before the containers start. Each entry is
+    #   {"kind": "redis", "unit": "<quadlet name>", "path": "<host data folder>"}  or
+    #   {"kind": "command", "name": "...", "check": [...], "repair": [...] (optional),
+    #    "unit": "<quadlet name the repair must not run under>" (optional)}
+    'data_checks': [],
 }
 PINNED = re.compile(r'^Image=(\S+@sha256:[0-9a-f]{64})\s*$', re.M)
 # Storage metadata that must be valid JSON whenever it exists.
@@ -75,12 +84,13 @@ def load_settings(path=None):
     return settings
 
 
-def run(command, timeout=600):
+def run(command, timeout=600, input_text=None):
     """Run a command; never raise for a non-zero exit."""
     try:
         # Podman echoes corrupt metadata bytes in its errors; never let decoding fail.
         result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
-                                errors='replace', timeout=timeout)
+                                errors='replace', timeout=timeout, input=input_text,
+                                stdin=None if input_text is not None else subprocess.DEVNULL)
         return result.returncode, (result.stdout + result.stderr).strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 127, type(exc).__name__ + ': ' + str(exc)
@@ -142,7 +152,7 @@ def check_storage(settings, full):
     database = STORAGE / 'db.sql'
     if database.is_file():
         try:
-            with sqlite3.connect('file:%s?mode=ro' % database, uri=True, timeout=10) as db:
+            with closing(sqlite3.connect('file:%s?mode=ro' % database, uri=True, timeout=10)) as db:
                 verdict = db.execute('PRAGMA quick_check').fetchone()[0]
             if verdict != 'ok':
                 problems.append('libpod database: ' + str(verdict)[:120])
@@ -231,6 +241,89 @@ def rebuild_storage(settings, report):
         report.setdefault('removed_broken', []).append(str(path))
 
 
+def unit_image(unit):
+    path = QUADLETS / (unit + '.container')
+    images = PINNED.findall(path.read_text()) if path.is_file() else []
+    if not images:
+        raise RuntimeError('%s: no image pinned by digest in %s' % (unit, path.name))
+    return images[0]
+
+
+def redis_commands(entry):
+    """Check and repair commands for a Redis data folder, run in a throwaway container."""
+    unit, path = entry.get('unit'), Path(entry.get('path') or '')
+    if not unit or not path.is_absolute():
+        raise RuntimeError('redis data check needs "unit" and an absolute "path"')
+    base = ['podman', 'run', '--rm', '-i', '--network', 'none', '-v', '%s:/data' % path,
+            '--entrypoint']
+    image = unit_image(unit)
+    if (path / 'appendonlydir').is_dir():  # Redis 7 multi-part AOF
+        # The folder is mode 700 and owned by the container's redis user, so list it from
+        # inside the user namespace. Never fall back to dump.rdb here: with AOF enabled,
+        # Redis loads the AOF, and a clean dump.rdb would hide a damaged AOF.
+        code, output = run(['podman', 'unshare', 'ls', '-1', str(path / 'appendonlydir')], 60)
+        manifests = sorted(name for name in output.splitlines() if name.endswith('.manifest'))
+        if code or not manifests:
+            raise RuntimeError('cannot find the AOF manifest in %s/appendonlydir' % path)
+        target = '/data/appendonlydir/' + manifests[0]
+    elif (path / 'appendonly.aof').is_file():
+        target = '/data/appendonly.aof'
+    elif (path / 'dump.rdb').is_file():
+        # No repair tool exists for RDB; check and report only.
+        return base + ['redis-check-rdb', image, '/data/dump.rdb'], None
+    else:
+        return None, None
+    return (base + ['redis-check-aof', image, target],
+            base + ['redis-check-aof', image, '--fix', target])
+
+
+def data_checks(settings, report, running, backed_up, repair_allowed=True):
+    """Run the configured data checks; repair failures after a backup. Returns unresolved names."""
+    unresolved = []
+    for entry in settings.get('data_checks') or []:
+        name = entry.get('name') or entry.get('unit') or entry.get('kind', '?')
+        result = {'name': name}
+        report.setdefault('data_checks', []).append(result)
+        if entry.get('unit') and entry['unit'] + '.service' in running:
+            # A live data file can look damaged mid-write; only check before the service starts.
+            result['state'] = 'skipped: %s is running' % entry['unit']
+            continue
+        try:
+            if entry.get('kind') == 'redis':
+                check, repair = redis_commands(entry)
+                if check is None:
+                    result['state'] = 'no data'
+                    continue
+            elif entry.get('kind') == 'command':
+                check, repair = list(entry['check']), entry.get('repair')
+            else:
+                raise RuntimeError('unknown data check kind: %r' % entry.get('kind'))
+            code, output = run(check, 900)
+            if code == 0:
+                result['state'] = 'ok'
+                continue
+            result['problem'] = (output.splitlines() or ['exit %d' % code])[-1][:200]
+            if not repair:
+                result['state'] = 'failed (no repair configured)'
+            elif not repair_allowed:
+                result['state'] = 'failed (check only)'
+            else:
+                if not backed_up:
+                    cold_backup(settings, report)
+                    backed_up = True
+                code, output = run(list(repair), 900, input_text='y\n')
+                result['repair'] = {'exit': code, 'output': output[-300:]}
+                code, output = run(check, 900)
+                result['state'] = 'repaired' if code == 0 else 'failed after repair'
+                if code:
+                    result['problem'] = (output.splitlines() or ['exit %d' % code])[-1][:200]
+        except (OSError, RuntimeError, KeyError, TypeError) as exc:
+            result['state'] = 'error: ' + str(exc)[:200]
+        if result['state'] not in ('ok', 'repaired', 'no data') and not result['state'].startswith('skipped'):
+            unresolved.append(name)
+    return unresolved
+
+
 def guard(settings=None):
     report = {'started_at': now(), 'host': os.uname().nodename, 'problems': []}
     clean = MARKER.is_file()
@@ -273,6 +366,15 @@ def guard(settings=None):
                     problems = check_storage(settings, full=True)
                     report['after_rebuild'] = problems
                     report['state'] = 'rebuilt' if not problems else 'needs_attention'
+        if report['state'] != 'needs_attention':
+            # Storage is usable, so the pinned images exist; now check the application data.
+            unresolved = data_checks(settings, report, running, backed_up='backup' in report)
+            if unresolved:
+                report.update(state='needs_attention',
+                              message='Data check failed: ' + ', '.join(unresolved))
+            elif report['state'] in ('clean', 'checked_after_abrupt_reset') and any(
+                    r.get('state') == 'repaired' for r in report.get('data_checks', [])):
+                report['state'] = 'data_repaired'
     except (OSError, RuntimeError) as exc:
         report.update(state='needs_attention', message=str(exc)[:300])
     except Exception as exc:  # A guard bug must still leave a report and let the containers start.
@@ -297,9 +399,13 @@ def main(argv=None):
     if action == 'stop':
         return mark_clean()
     if action == 'check':
-        problems = check_storage(load_settings(), full=True)
-        print(json.dumps({'problems': problems}))
-        return 1 if problems else 0
+        settings = load_settings()
+        problems = check_storage(settings, full=True)
+        report = {}
+        unresolved = data_checks(settings, report, containers_running(settings),
+                                 backed_up=True, repair_allowed=False)
+        print(json.dumps({'problems': problems, 'data_checks': report.get('data_checks', [])}))
+        return 1 if problems or unresolved else 0
     return guard()
 
 
