@@ -1,5 +1,7 @@
 # Podman storage guard
 
+[![Tests](https://github.com/MCsumz/podman-storage-guard/actions/workflows/tests.yml/badge.svg)](https://github.com/MCsumz/podman-storage-guard/actions/workflows/tests.yml)
+
 A boot guard for **rootless Podman with Quadlet containers** on fragile storage. After every
 boot, before your containers start, it checks Podman's storage. If the last shutdown was abrupt
 or the storage is damaged, it backs up your data first and then repairs the storage in stages.
